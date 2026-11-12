@@ -1,0 +1,183 @@
+name: Données hors ligne
+
+# Prépare les données hors ligne de Moto Alerte (Île-de-France + Oise) à partir d'OpenStreetMap
+# (Geofabrik) et de la Base Adresse Nationale :
+#   roads.bin      tronçons, limitations, noms, graphe d'itinéraire, interdictions de tourner
+#   search.sqlite  communes, voies et numéros (BAN), lieux utiles (OSM)
+#   map.pmtiles    fond de carte vectoriel (schéma OpenMapTiles, planetiler)
+#
+# area=fixture : petit secteur Cergy – Franconville, publié sur la branche offline-fixture (tests).
+# area=full    : zone complète, publiée dans une release data-AAAAMMJJ + release « data » (manifeste).
+# Exécution mensuelle automatique (zone complète) ; l'appli Moto Alerte lit le manifeste de la release « data ».
+
+on:
+  schedule:
+    # le 3 de chaque mois, 3 h 17 UTC (extraits Geofabrik et BAN de la nuit)
+    - cron: "17 3 3 * *"
+  workflow_dispatch:
+    inputs:
+      area:
+        description: "fixture (secteur de test) ou full (Île-de-France + Oise)"
+        type: choice
+        options: [fixture, full]
+        default: fixture
+      tiles:
+        description: "Générer le fond de carte (full uniquement)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  data:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      AREA: ${{ inputs.area || 'full' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Outils
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq osmium-tool >/dev/null
+          pip install -q osmium
+          df -h . | tail -1
+
+      - name: Zone
+        run: |
+          if [ "$AREA" = fixture ]; then
+            echo "BBOX=1.98,48.96,2.30,49.08" >> $GITHUB_ENV
+            echo "DEPTS=95" >> $GITHUB_ENV
+          else
+            echo "BBOX=1.44,48.12,3.56,49.77" >> $GITHUB_ENV
+            echo "DEPTS=75 77 78 91 92 93 94 95 60" >> $GITHUB_ENV
+          fi
+          echo "VERSION=$(date -u +%Y%m%d)" >> $GITHUB_ENV
+
+      - name: Extrait OpenStreetMap
+        run: |
+          mkdir -p work out
+          cd work
+          curl -sSfL -o idf.osm.pbf https://download.geofabrik.de/europe/france/ile-de-france-latest.osm.pbf
+          if [ "$AREA" = full ]; then
+            curl -sSfL -o pic.osm.pbf https://download.geofabrik.de/europe/france/picardie-latest.osm.pbf
+            osmium merge idf.osm.pbf pic.osm.pbf -o merged.osm.pbf
+          else
+            mv idf.osm.pbf merged.osm.pbf
+          fi
+          osmium extract -b "$BBOX" -s smart --set-bounds merged.osm.pbf -o area.osm.pbf
+          osmium tags-filter area.osm.pbf w/highway r/type=restriction n/highway=motorway_junction -o roads.osm.pbf
+          osmium tags-filter area.osm.pbf nwr/amenity nwr/shop nwr/tourism nwr/railway=station,halt nwr/leisure nwr/aeroway=aerodrome nwr/historic -o pois.osm.pbf
+          ls -la
+
+      - name: Base routière (roads.bin)
+        run: python3 tools/offline/build_roads.py work/roads.osm.pbf out/roads.bin --version $VERSION
+
+      - name: Base de recherche (search.sqlite)
+        run: |
+          # Base Adresse Nationale : « latest », sinon les millésimes datés les plus récents de l'index,
+          # sinon BANO (OpenStreetMap France). Le lien « latest » répond parfois 404 depuis GitHub.
+          UA="Mozilla/5.0 (X11; Linux x86_64) MotoAlerte-data/1.0"
+          BASE=https://adresse.data.gouv.fr/data/ban/adresses
+          DATES=$(curl -sSL --retry 3 -A "$UA" "$BASE/" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | sort -ru | head -4 || true)
+          echo "Millésimes : $DATES"
+          for d in $DEPTS; do
+            ok=0
+            for v in latest $DATES; do
+              if curl -sSfL --retry 3 --retry-delay 5 -A "$UA" -o work/ban-$d.csv.gz "$BASE/$v/csv/adresses-$d.csv.gz"; then
+                echo "BAN $d : $v"; ok=1; break
+              fi
+            done
+            if [ $ok = 0 ]; then
+              echo "BAN $d indisponible, repli sur BANO"
+              curl -sSfL --retry 3 -A "$UA" -o work/ban-$d.csv.gz "https://bano.openstreetmap.fr/data/bano-$d.csv.gz" \
+                || { curl -sSfL --retry 3 -A "$UA" -o work/bano-$d.csv "https://bano.openstreetmap.fr/data/bano-$d.csv" && gzip -c work/bano-$d.csv > work/ban-$d.csv.gz; }
+            fi
+            ls -la work/ban-$d.csv.gz
+          done
+          BB=""; [ "$AREA" = fixture ] && BB="--bbox $BBOX"
+          python3 tools/offline/build_search.py out/search.sqlite --ban work/ban-*.csv.gz --pois work/pois.osm.pbf $BB
+
+      - name: Java (planetiler)
+        if: env.AREA == 'full' && inputs.tiles != false
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Fond de carte (map.pmtiles)
+        if: env.AREA == 'full' && inputs.tiles != false
+        run: |
+          curl -sSfL -o work/planetiler.jar https://github.com/onthegomap/planetiler/releases/latest/download/planetiler.jar
+          java -Xmx5g -jar work/planetiler.jar --osm-path=work/area.osm.pbf --output=out/map.pmtiles \
+            --bounds=$BBOX --download --download-threads=4 --force --tmpdir=work/tmp \
+            --nodemap-type=sparsearray --storage=mmap --maxzoom=14
+          rm -rf work/tmp data/sources 2>/dev/null || true
+
+      - name: Contrôles
+        run: |
+          ls -la out
+          python3 - <<'EOF'
+          import sqlite3, struct
+          b = open('out/roads.bin', 'rb').read(128)
+          h = struct.unpack_from('<4s17i', b, 0)
+          print('roads.bin', h[:9])
+          assert h[0] == b'MAR1' and h[3] > 0 and h[5] > 0
+          db = sqlite3.connect('out/search.sqlite')
+          print('search', db.execute('select kind, count(*) from places group by kind').fetchall())
+          print(db.execute("select p.name, p.detail from places_fts f join places p on p.id=f.docid where f.norm match 'gare* cergy*' limit 5").fetchall())
+          EOF
+
+      - name: Publication (fixture → branche offline-fixture)
+        if: env.AREA == 'fixture'
+        run: |
+          mkdir -p /tmp/fx && cp out/roads.bin out/search.sqlite /tmp/fx/
+          git config user.name "github-actions" && git config user.email "actions@github.com"
+          git fetch origin offline-fixture || true
+          git checkout --orphan offline-fixture-new
+          git rm -rq --cached . && git clean -fdq -e out -e work
+          cp /tmp/fx/* .
+          git add roads.bin search.sqlite
+          git commit -qm "Données de test hors ligne $VERSION ($BBOX)"
+          git push -f origin HEAD:offline-fixture
+
+      - name: Publication (full → release)
+        if: env.AREA == 'full'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd out
+          gzip -9 -k roads.bin && gzip -9 -k search.sqlite
+          TAG="data-$VERSION"
+          BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/$TAG"
+          python3 - "$BASE" <<'EOF'
+          import hashlib, json, os, sys, datetime
+          base = sys.argv[1]
+          def sha(p):
+              h = hashlib.sha256()
+              with open(p, 'rb') as f:
+                  for c in iter(lambda: f.read(1 << 20), b''): h.update(c)
+              return h.hexdigest()
+          files = []
+          for name, src, gz in (('roads.bin', 'roads.bin.gz', True), ('search.sqlite', 'search.sqlite.gz', True), ('map.pmtiles', 'map.pmtiles', False)):
+              if not os.path.exists(src): continue
+              files.append({'name': name, 'url': f'{base}/{src}', 'gz': gz, 'size': os.path.getsize(src),
+                            'bytes': os.path.getsize(name), 'sha256': sha(name)})
+          m = {'format': 1, 'version': int(os.environ['VERSION']), 'date': datetime.date.today().isoformat(),
+               'area': 'Île-de-France + Oise', 'bbox': [float(x) for x in os.environ['BBOX'].split(',')], 'files': files}
+          json.dump(m, open('manifest.json', 'w'), ensure_ascii=False, indent=1)
+          print(json.dumps(m, ensure_ascii=False, indent=1))
+          EOF
+          ASSETS="manifest.json roads.bin.gz search.sqlite.gz"; [ -f map.pmtiles ] && ASSETS="$ASSETS map.pmtiles"
+          gh release delete "$TAG" -y --cleanup-tag 2>/dev/null || true
+          # On garde les 3 dernières versions
+          for old in $(gh release list --limit 50 --json tagName --jq '.[].tagName' | grep '^data-' | sort -r | tail -n +3); do
+            gh release delete "$old" -y --cleanup-tag || true
+          done
+          gh release create "$TAG" $ASSETS --title "Données hors ligne $VERSION" \
+            --notes "Île-de-France + Oise — © contributeurs OpenStreetMap (ODbL), Base Adresse Nationale (Licence Ouverte)."
+          # Release « data » : uniquement le manifeste, à adresse fixe pour l'appli
+          gh release delete data -y --cleanup-tag 2>/dev/null || true
+          gh release create data manifest.json --title "Données hors ligne (dernière version)" --latest=false \
+            --notes "Manifeste de la dernière version : $TAG"
